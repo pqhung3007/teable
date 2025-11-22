@@ -16,9 +16,29 @@
 
 ## 1. Data Persistence Architecture
 
+### Overview
+
+Teable's data persistence layer solves a fundamental challenge: **how to provide spreadsheet-like flexibility while maintaining database-level performance and reliability**. Traditional databases require fixed schemas defined upfront, but no-code platforms need users to add, remove, and modify columns on the fly without writing SQL.
+
+The solution is a **two-tier architecture** that separates schema metadata from actual data storage. This allows Teable to:
+- Let users create and modify fields instantly without downtime
+- Leverage native database features (indexes, constraints, generated columns) for performance
+- Support 20+ field types with type-specific storage and querying
+- Enable real-time collaboration through optimistic locking and versioning
+
 ### 1.1 Dynamic Schema Management
 
-Teable uses a **hybrid approach** combining metadata tables with dynamically created physical tables:
+Teable uses a **hybrid approach** combining metadata tables with dynamically created physical tables. The key insight is that while users see "tables" and "fields," the system actually maintains two parallel representations:
+
+1. **Metadata Layer**: Prisma-managed tables (`TableMeta`, `Field`, `View`) that store configuration, types, and relationships. These are schema-stable and define what data looks like.
+
+2. **Physical Layer**: Dynamically created database tables (e.g., `tbl_abc123`) with columns generated at runtime. These hold the actual user data and leverage native database features.
+
+This separation provides several benefits:
+- **Schema changes are fast**: Adding a field just requires an `ALTER TABLE` rather than migrating a fixed schema
+- **Type safety is preserved**: Each field type maps to an appropriate database type (VARCHAR, NUMERIC, JSONB, etc.)
+- **Indexing is native**: Physical columns can be indexed for query performance
+- **Database features work**: Foreign keys, constraints, and generated columns all function normally
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -55,22 +75,38 @@ Teable uses a **hybrid approach** combining metadata tables with dynamically cre
 
 ### 1.2 Field Type System
 
+The field type system is the heart of Teable's flexibility. Each field type encapsulates:
+- **Storage strategy**: How data is physically stored in the database
+- **Value conversion**: How to transform between user-facing values and database values
+- **Validation rules**: What constitutes valid input for this type
+- **Query behavior**: How filtering, sorting, and aggregation work for this type
+
+The design follows a **Strategy Pattern** where each field type implements a common interface but provides type-specific behavior. This allows the system to handle a `Number` field completely differently from a `Link` field while presenting a unified API.
+
 **20+ Field Types Supported:**
 
-| Category | Field Types | Storage Type |
-|----------|-------------|--------------|
-| **Text** | SingleLineText, LongText | VARCHAR, TEXT |
-| **Numeric** | Number, Rating, AutoNumber | NUMERIC, INTEGER, SERIAL |
-| **Selection** | SingleSelect, MultipleSelect | VARCHAR, JSONB |
-| **Date/Time** | Date, CreatedTime, LastModifiedTime | TIMESTAMP |
-| **Boolean** | Checkbox | BOOLEAN |
-| **Files** | Attachment | JSONB |
-| **Relations** | Link, User | JSONB |
-| **Computed** | Formula, Lookup, Rollup | GENERATED or VIEW |
-| **System** | CreatedBy, LastModifiedBy | VARCHAR |
-| **Interactive** | Button | N/A |
+| Category | Field Types | Storage Type | Rationale |
+|----------|-------------|--------------|-----------|
+| **Text** | SingleLineText, LongText | VARCHAR, TEXT | Native string operations, full-text search |
+| **Numeric** | Number, Rating, AutoNumber | NUMERIC, INTEGER, SERIAL | Precise arithmetic, native aggregations |
+| **Selection** | SingleSelect, MultipleSelect | VARCHAR, JSONB | Single values as string; multiple as JSON array |
+| **Date/Time** | Date, CreatedTime, LastModifiedTime | TIMESTAMP | Timezone-aware, supports date math |
+| **Boolean** | Checkbox | BOOLEAN | Native boolean operations |
+| **Files** | Attachment | JSONB | Flexible metadata structure per file |
+| **Relations** | Link, User | JSONB | Store reference IDs with denormalized titles |
+| **Computed** | Formula, Lookup, Rollup | GENERATED or VIEW | See formula engine for evaluation strategy |
+| **System** | CreatedBy, LastModifiedBy | VARCHAR | Automatic audit trail |
+| **Interactive** | Button | N/A | UI-only, triggers automations |
+
+**Why JSONB for complex types?** PostgreSQL's JSONB provides the best of both worlds: flexible document storage with indexable, queryable access. For multi-value fields like attachments or links, this avoids the need for separate junction tables while still supporting operators like `@>` (contains) for filtering.
 
 ### 1.3 Field Metadata Storage
+
+Field configuration is stored as JSON in the `options` column, enabling extensibility without schema migrations. Each field type defines its own options structure, and the backend validates these during field creation/update. This pattern allows:
+
+- Adding new field options without database migrations
+- Type-specific configuration (e.g., `precision` for numbers, `choices` for selects)
+- Forward compatibility when new features are added
 
 ```typescript
 // Field model stores configuration as JSON
@@ -100,6 +136,8 @@ interface IFieldMetadata {
 
 ### 1.4 Schema Versioning
 
+Version tracking is critical for a collaborative platform where multiple users may be editing the same data simultaneously. Teable implements versioning at three distinct levels, each serving a different purpose:
+
 **Version Tracking at Multiple Levels:**
 
 ```prisma
@@ -117,16 +155,35 @@ model Ops {
 }
 ```
 
-**Version Uses:**
-- Optimistic locking for concurrent updates
-- ShareDB operational transformation
-- Cache invalidation triggers
+**Why three version levels?**
+
+| Level | Purpose | Incremented When |
+|-------|---------|------------------|
+| **TableMeta.version** | Optimistic locking for schema changes | Field added/removed, table renamed |
+| **Field.version** | Track field configuration changes | Field options modified |
+| **Ops.version** | Operational Transformation ordering | Any data operation via ShareDB |
+
+**How versioning enables collaboration:**
+1. **Conflict detection**: Before applying a change, check if the version matches. If not, another user modified the resource.
+2. **Cache invalidation**: When a version changes, cached data for that resource becomes stale.
+3. **Real-time sync**: ShareDB uses operation versions to order and transform concurrent edits.
 
 ---
 
 ## 2. Record Storage
 
+### Overview
+
+Record storage in Teable balances flexibility with performance. Unlike traditional ORMs where each model has a fixed structure, Teable's records are stored in dynamically-created tables where columns are added at runtime. This section explains how individual rows are structured and how the system maintains data integrity.
+
 ### 2.1 Row-Level Data Structure
+
+Every physical table includes a set of **system columns** that Teable manages automatically, plus **user-defined columns** created by field definitions. The system columns provide:
+
+- **Identity**: A unique record ID (`__id`) that persists even if the record is moved or renamed
+- **Ordering**: An auto-increment number (`__auto_number`) for stable default sorting
+- **Audit trail**: Timestamps and user IDs for creation and modification
+- **Concurrency control**: A version number (`__version`) for optimistic locking
 
 Each record in a physical table has:
 
@@ -151,17 +208,21 @@ CREATE TABLE "tbl_xxx" (
 
 ### 2.2 Cell Value Storage Strategy
 
-| Field Type | Storage | Example Value |
-|------------|---------|---------------|
-| SingleLineText | VARCHAR | `'Hello World'` |
-| Number | NUMERIC | `123.45` |
-| Checkbox | BOOLEAN | `true` |
-| SingleSelect | VARCHAR | `'Option A'` |
-| MultipleSelect | JSONB | `['Option A', 'Option B']` |
-| Date | TIMESTAMP | `'2024-01-15T10:30:00Z'` |
-| Attachment | JSONB | `[{id, name, size, token, path}]` |
-| Link | JSONB | `[{id: 'rec_xxx', title: '...'}]` |
-| User | JSONB | `[{id: 'usr_xxx', title: '...'}]` |
+The storage strategy for each field type is carefully chosen to balance query performance with flexibility. The key principle is: **use the most specific database type that can represent the data**. This enables native database operations (sorting numbers numerically, comparing dates chronologically) while preserving the flexibility needed for complex types.
+
+| Field Type | Storage | Example Value | Why This Type |
+|------------|---------|---------------|---------------|
+| SingleLineText | VARCHAR | `'Hello World'` | Supports LIKE queries, indexing |
+| Number | NUMERIC | `123.45` | Precise arithmetic, native comparisons |
+| Checkbox | BOOLEAN | `true` | Native boolean logic |
+| SingleSelect | VARCHAR | `'Option A'` | Fast equality checks, low storage |
+| MultipleSelect | JSONB | `['Option A', 'Option B']` | Array containment queries |
+| Date | TIMESTAMP | `'2024-01-15T10:30:00Z'` | Date arithmetic, timezone support |
+| Attachment | JSONB | `[{id, name, size, token, path}]` | Flexible metadata per file |
+| Link | JSONB | `[{id: 'rec_xxx', title: '...'}]` | Denormalized for display performance |
+| User | JSONB | `[{id: 'usr_xxx', title: '...'}]` | Consistent with link structure |
+
+**Denormalization in Link/User fields**: Notice that link and user fields store both the `id` and a `title`. This is intentional denormalization—it avoids JOIN queries when displaying linked records in the UI. The title is updated asynchronously when the source record changes.
 
 ### 2.3 Audit Trail Implementation
 
@@ -227,7 +288,20 @@ model RecordTrash {
 
 ## 3. Relationship Management
 
+### Overview
+
+Relationships are one of the most complex aspects of a no-code database. Unlike traditional databases where relationships are defined by foreign keys at design time, Teable allows users to create links between any tables at runtime. The system must handle:
+
+- **Bidirectional links**: When Table A links to Table B, Table B should automatically show which records in Table A reference it
+- **Many-to-many relationships**: Users can link multiple records without understanding junction tables
+- **Cascading updates**: When a linked record's title changes, all references should update
+- **Referential integrity**: Deleted records must be unlinked from all referring records
+
+The design philosophy is to **hide database complexity while preserving database power**. Users see a simple "link" field; behind the scenes, Teable manages foreign keys, junction tables, and cascade operations.
+
 ### 3.1 Link Fields Between Tables
+
+Every link field creates a **bidirectional relationship** by default. When you create a link from Table A to Table B, Teable automatically creates a corresponding "symmetric" field in Table B pointing back to Table A. This ensures users can navigate relationships from either direction.
 
 **Bidirectional Link System:**
 
@@ -259,7 +333,11 @@ interface ILinkFieldOptions {
 
 ### 3.2 Foreign Key Handling
 
-**Junction Table for Many-to-Many:**
+The relationship type determines how data is physically stored:
+
+**One-to-One / One-to-Many**: The "many" side stores the foreign key directly in a JSONB column. No additional tables are needed.
+
+**Many-to-Many**: Requires a junction table to store the relationship pairs. Teable creates and manages this automatically:
 
 ```sql
 -- Auto-created for manyToMany relationships
@@ -270,11 +348,18 @@ CREATE TABLE "junction_tblA_tblB" (
 );
 ```
 
+**Why junction tables for many-to-many?** While JSONB arrays could store multiple references, junction tables enable:
+- Database-enforced referential integrity via foreign keys
+- Efficient queries for "find all records linked to X"
+- Standard indexing on both sides of the relationship
+
 **LinkService Responsibilities:**
-- Create symmetric link fields
-- Maintain junction tables
-- Cascade link value updates
-- Handle link field deletion
+The `LinkService` (at 59KB, one of the largest services) handles all relationship complexity:
+- Create symmetric link fields in both tables
+- Maintain junction tables (create, populate, drop)
+- Cascade link value updates when titles change
+- Handle link field deletion (clean up symmetric field and junction table)
+- Resolve self-referential links (a table linking to itself)
 
 ### 3.3 Cascading Operations
 
@@ -320,40 +405,68 @@ model Reference {
 
 ## 4. View Processing Backend
 
+### Overview
+
+Views in Teable are **saved query configurations** that determine how data is displayed and filtered. Unlike materialized views in traditional databases, Teable views are evaluated at query time—they don't duplicate data but rather store the parameters (filters, sorts, field visibility) that shape the query.
+
+This design enables:
+- **Multiple perspectives on the same data**: Sales team sees one view, Operations sees another, but changes sync instantly
+- **No data duplication**: Views are cheap to create and don't consume storage
+- **Real-time consistency**: Data updates appear in all views immediately
+
+Each view type provides a different visualization paradigm while sharing the same underlying filtering and sorting infrastructure.
+
 ### 4.1 View Types
 
-| Type | Purpose | Key Options |
-|------|---------|-------------|
-| **Grid** | Spreadsheet-like | `rowHeight`, `frozenColumnCount` |
-| **Kanban** | Card-based boards | `stackFieldId`, `coverFieldId` |
-| **Gallery** | Visual grid | `coverFieldId`, `isCoverFit` |
-| **Calendar** | Date-based | `startDateFieldId`, `endDateFieldId` |
-| **Form** | Data entry | `coverUrl`, `logoUrl`, `submitLabel` |
-| **Plugin** | Custom views | `pluginId`, `pluginInstallId` |
+| Type | Purpose | Key Options | Backend Considerations |
+|------|---------|-------------|------------------------|
+| **Grid** | Spreadsheet-like | `rowHeight`, `frozenColumnCount` | Supports all filter/sort/group operations |
+| **Kanban** | Card-based boards | `stackFieldId`, `coverFieldId` | Groups by single-select field, requires special aggregation |
+| **Gallery** | Visual grid | `coverFieldId`, `isCoverFit` | Optimized for attachment field display |
+| **Calendar** | Date-based | `startDateFieldId`, `endDateFieldId` | Date range queries, recurring event support |
+| **Form** | Data entry | `coverUrl`, `logoUrl`, `submitLabel` | Write-only view, public sharing support |
+| **Plugin** | Custom views | `pluginId`, `pluginInstallId` | Delegated to plugin system |
+
+**Note on Form views**: Unlike other views, forms are primarily for data input rather than display. They can be shared publicly without authentication and have their own permission model.
 
 ### 4.2 Server-Side Filtering
+
+Filtering is one of the most complex features in the query engine. The filter system must:
+- Support nested boolean logic (AND/OR groups within groups)
+- Handle 40+ operators across different field types
+- Generate efficient SQL for both PostgreSQL and SQLite
+- Support dynamic field references (filter by "another field's value")
+
+The filter structure is recursive, allowing arbitrarily nested conditions:
 
 **Filter Structure:**
 ```typescript
 interface IFilter {
   conjunction: 'and' | 'or';
-  filterSet: (IFilterItem | IFilter)[];  // Nested groups
+  filterSet: (IFilterItem | IFilter)[];  // Nested groups allow complex logic
 }
 
 interface IFilterItem {
   fieldId: string;
   operator: FilterOperator;
   value: any;
-  isSymbol?: boolean;  // Field reference
+  isSymbol?: boolean;  // When true, value is a fieldId to compare against
 }
 ```
 
-**40+ Filter Operators:**
-- Text: `is`, `isNot`, `contains`, `doesNotContain`, `startsWith`, `endsWith`
-- Numbers: `isGreater`, `isLess`, `isGreaterEqual`, `isLessEqual`
-- Dates: `isBefore`, `isAfter`, `isWithIn`, `today`, `pastWeek`, etc.
-- Multi-value: `isAnyOf`, `hasAllOf`, `isExactly`
-- Null: `isEmpty`, `isNotEmpty`
+**Why `isSymbol`?** This enables filters like "Show records where Due Date is after Created Date"—comparing two fields rather than a field to a constant value.
+
+**40+ Filter Operators by Category:**
+
+| Category | Operators | Notes |
+|----------|-----------|-------|
+| Text | `is`, `isNot`, `contains`, `doesNotContain`, `startsWith`, `endsWith` | Case-insensitive by default |
+| Numbers | `isGreater`, `isLess`, `isGreaterEqual`, `isLessEqual` | Handles NULL gracefully |
+| Dates | `isBefore`, `isAfter`, `isWithIn`, `today`, `pastWeek`, etc. | Dynamic operators like `today` evaluated at query time |
+| Multi-value | `isAnyOf`, `hasAllOf`, `isExactly` | Array intersection/containment logic |
+| Null | `isEmpty`, `isNotEmpty` | Works across all field types |
+
+**Filter Query Generation**: Each field type has a `FilterAdapter` that knows how to generate SQL for its operators. For example, filtering a JSONB multi-select field uses different SQL than filtering a VARCHAR text field.
 
 ### 4.3 Grouping & Aggregation
 
@@ -410,17 +523,38 @@ model View {
 
 ## 5. API Layer Architecture
 
+### Overview
+
+Teable exposes a RESTful API that follows resource-oriented design principles. The API serves three distinct audiences:
+
+1. **Internal Frontend**: The Next.js web application makes API calls for all operations
+2. **External Integrations**: Third-party applications can automate data operations
+3. **Plugins**: Dashboard widgets and custom views access data through the API
+
+The API design prioritizes:
+- **Consistency**: Same patterns across all resource types
+- **Discoverability**: Hierarchical URLs reflect data relationships
+- **Efficiency**: Bulk operations reduce HTTP round-trips
+- **Security**: Fine-grained permissions checked at every endpoint
+
 ### 5.1 REST API Design
+
+The URL structure follows a **hierarchical pattern** that mirrors the data model. Each level of nesting represents a containment relationship:
 
 **Resource Naming:**
 ```
-/api/space                     # Workspace management
-/api/base                      # Database management
-/api/table/{tableId}           # Table operations
-/api/table/{tableId}/field     # Field CRUD
-/api/table/{tableId}/view      # View CRUD
-/api/table/{tableId}/record    # Record CRUD
+/api/space                     # Workspaces (top-level containers)
+/api/base                      # Databases within spaces
+/api/table/{tableId}           # Tables within bases
+/api/table/{tableId}/field     # Fields (columns) within tables
+/api/table/{tableId}/view      # Views within tables
+/api/table/{tableId}/record    # Records (rows) within tables
 ```
+
+**Why table-centric URLs?** Most operations are table-scoped. By making `tableId` part of the URL, we:
+- Simplify permission checking (table permissions cascade to fields/views/records)
+- Enable efficient caching (invalidate by table)
+- Provide clear context in logs and debugging
 
 **CRUD Patterns:**
 ```typescript
@@ -433,19 +567,27 @@ DELETE /api/table/{tableId}/record/{id}     // Delete record
 
 ### 5.2 Bulk Operations
 
+Spreadsheet-like applications often need to create, update, or delete hundreds of records at once. Making individual API calls for each record would be prohibitively slow. Teable's bulk operations address this with:
+
+- **Transactional batching**: All records in a bulk operation succeed or fail together
+- **Optimized SQL**: Single multi-row INSERT/UPDATE instead of individual statements
+- **Event aggregation**: Domain events are combined to reduce downstream processing
+
 ```typescript
-// Bulk create
+// Bulk create - up to 1000 records per request
 POST /api/table/{tableId}/record
 Body: { records: [{ fields: {...} }, ...], fieldKeyType?: 'id' | 'name' }
 
-// Bulk update
+// Bulk update - atomic, all-or-nothing
 PATCH /api/table/{tableId}/record
 Body: { records: [{ id: '...', fields: {...} }, ...] }
 
-// Bulk delete
+// Bulk delete - triggers cascade cleanup
 DELETE /api/table/{tableId}/record
 Body: { recordIds: ['rec_xxx', 'rec_yyy'] }
 ```
+
+**The `fieldKeyType` option**: By default, fields are identified by ID (`fld_xxx`). Setting `fieldKeyType: 'name'` allows using human-readable field names, which is more convenient for integrations but requires an extra lookup step.
 
 ### 5.3 Query Language (Filtering)
 
@@ -547,7 +689,20 @@ CREATE INDEX "idx_collaborator_resource" ON "collaborator"("resource_id");
 
 ## 7. Plugin/Extension Backend
 
+### Overview
+
+Teable's plugin system allows extending functionality without modifying core code. Plugins are **sandboxed web applications** that run in iframes and communicate with Teable through a bridge API. This architecture provides:
+
+- **Security isolation**: Plugins can't access data they're not authorized for
+- **Independent deployment**: Plugins can be updated without Teable releases
+- **Developer flexibility**: Plugins can use any frontend framework
+- **Graceful degradation**: A broken plugin doesn't crash the main application
+
+The plugin model is inspired by VS Code extensions and Figma plugins—providing rich capabilities while maintaining security boundaries.
+
 ### 7.1 Plugin Architecture
+
+The architecture follows a **host-guest model** where Teable (the host) embeds plugins (guests) in iframes and mediates all communication:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -566,6 +721,8 @@ CREATE INDEX "idx_collaborator_resource" ON "collaborator"("resource_id");
             │ (Dashboard)   │   │ (View)        │
             └───────────────┘   └───────────────┘
 ```
+
+**Why iframes?** Iframes provide browser-native security isolation. A plugin cannot access Teable's DOM, cookies, or localStorage. All data access must go through the bridge API, which enforces permissions.
 
 ### 7.2 Plugin Positions
 

@@ -14,16 +14,35 @@
 
 ## 1. Database Schema Design
 
+### Overview
+
+The database schema is the foundation of Teable's architecture. Unlike traditional applications where the schema is fixed at development time, Teable must support user-defined tables and fields created at runtime. This presents unique challenges:
+
+- **Dynamic structure**: Users create tables and fields without writing SQL
+- **Type safety**: Each field type needs appropriate database representation
+- **Performance**: Dynamically created tables must still support fast queries
+- **Multi-tenancy**: Multiple workspaces share the same database safely
+
+The solution is a **metadata-driven approach** where fixed "metadata tables" (managed by Prisma) describe dynamic "data tables" (created via raw SQL at runtime).
+
 ### 1.1 Core Model Hierarchy
 
+Understanding the containment hierarchy is essential for navigating the codebase. Each level owns the resources below it:
+
 ```
-Space (workspace)
-└── Base (database container)
-    └── TableMeta (table definition)
-        ├── Field (column definitions)
-        ├── View (view configurations)
-        └── Records (via physical table)
+Space (workspace)                   # Top-level container, billing unit
+└── Base (database container)       # Logical grouping of related tables
+    └── TableMeta (table definition)# Metadata about a user table
+        ├── Field (column definitions)  # What columns the table has
+        ├── View (view configurations)  # Saved filter/sort/grouping
+        └── Records (via physical table)# Actual data rows
 ```
+
+**Why this hierarchy?**
+- **Space** provides workspace-level isolation and is the unit for access control
+- **Base** groups related tables (like a project or department)
+- **TableMeta** bridges between the metadata world and physical data tables
+- **Field/View** are configuration stored in metadata, not in user data
 
 ### 1.2 Key Models
 
@@ -134,20 +153,39 @@ model Field {
 
 ### 1.4 Multi-Tenancy Approach
 
-Teable uses **workspace-based isolation**:
+Multi-tenancy—serving multiple customers from a single deployment—is implemented through **workspace-based isolation** rather than database-per-tenant. This approach:
 
+- **Simplifies operations**: One database to backup, monitor, and scale
+- **Enables resource sharing**: Efficient for small workspaces that don't need dedicated resources
+- **Supports collaboration**: Users can be members of multiple workspaces
+
+The access path for any request:
 ```
 User → AccessToken/Session → Collaborator → Space/Base
 ```
 
-**No explicit Organization model** - Instead:
-- **Space** is the top-level container
-- **Collaborator** provides fine-grained access at Space or Base level
-- **Access Tokens** can be scoped to specific spaces/bases
+**Permission enforcement** happens at the `Collaborator` level:
+- A `Collaborator` record links a user to a Space or Base with a specific role
+- Every API request checks collaborator permissions before accessing data
+- **Access Tokens** can be scoped to specific spaces/bases for API integrations
+
+**No explicit Organization model** - Teable keeps the model simple:
+- **Space** is the top-level container (effectively an "organization")
+- Multiple spaces can belong to the same user
+- Billing and quotas are tracked at the Space level
 
 ---
 
 ## 2. Dynamic Field Storage
+
+### Overview
+
+Dynamic field storage is what enables Teable's no-code flexibility. When a user adds a "Number" column to their table, Teable must:
+1. Update the metadata (Field table) to record the new column's configuration
+2. Execute DDL (ALTER TABLE) to add the physical column to the data table
+3. Handle the type conversion between UI values and database storage
+
+This section explains how fields are physically represented in the database.
 
 ### 2.1 Physical Table Creation
 
@@ -238,16 +276,34 @@ Complex field types use JSONB storage:
 
 ## 3. Query Engine
 
+### Overview
+
+The query engine translates high-level record queries into optimized SQL. This is challenging because:
+
+- **Dynamic schemas**: The query engine doesn't know table structures at compile time
+- **Multiple databases**: SQL must work for both PostgreSQL and SQLite
+- **Complex filtering**: 40+ operators across different field types require type-specific SQL
+- **Performance**: Queries on large tables must use indexes effectively
+
+Teable uses **Knex.js** as a query builder, with a custom abstraction layer (`DbProvider`) that handles database-specific differences.
+
 ### 3.1 Architecture Overview
+
+The query building process follows a pipeline pattern where each stage adds to the query:
 
 ```
 RecordQueryBuilderService
     │
-    ├── createQueryBuilder()     → Base Knex query
+    ├── createQueryBuilder()     → Base Knex query with table reference
     ├── buildSelect()            → SELECT clause via FieldSelectVisitor
+    │                              (handles computed fields, type conversions)
     ├── buildFilter()            → WHERE clause via FilterQuery
+    │                              (type-specific operators, nested conditions)
     └── buildSort()              → ORDER BY via SortQuery
+                                   (NULL handling, multi-column sort)
 ```
+
+**Why Knex instead of Prisma for queries?** Prisma is great for typed CRUD on known schemas, but Teable's dynamic tables require raw SQL flexibility. Knex provides a nice middle ground—programmatic query building with database abstraction.
 
 ### 3.2 Database Provider Interface
 
@@ -274,51 +330,61 @@ interface IDbProvider {
 
 ### 3.3 Filter Query System
 
+The filter system is where database abstraction becomes most complex. Each combination of field type and operator requires specific SQL generation, and that SQL differs between PostgreSQL and SQLite.
+
 **Filter Structure:**
 ```typescript
 interface IFilter {
-  filterSet: IFilterItem[];
-  conjunction: 'and' | 'or';
+  filterSet: IFilterItem[];    // Array of conditions
+  conjunction: 'and' | 'or';   // How to combine them
 }
 
 interface IFilterItem {
-  fieldId: string;
-  operator: FilterOperator;
-  value: any;
+  fieldId: string;             // Which field to filter
+  operator: FilterOperator;    // Which comparison to use
+  value: any;                  // Value to compare against
 }
 ```
 
 **Filter Operators by Field Type:**
 
-| Field Type | Operators |
-|------------|-----------|
-| Text | is, isNot, contains, doesNotContain, isEmpty, isNotEmpty, startsWith, endsWith |
-| Number | is, isNot, isGreater, isLess, isGreaterEqual, isLessEqual, isEmpty, isNotEmpty |
-| Date | is, isNot, isBefore, isAfter, isOnOrBefore, isOnOrAfter, isWithin, isEmpty |
-| Select | is, isNot, isAnyOf, isNoneOf, isEmpty, isNotEmpty |
-| Checkbox | is |
-| Link | contains, doesNotContain, isExactly, isEmpty, isNotEmpty |
+Different field types support different operators. For example, "contains" makes sense for text but not for numbers.
+
+| Field Type | Operators | Notes |
+|------------|-----------|-------|
+| Text | is, isNot, contains, doesNotContain, isEmpty, isNotEmpty, startsWith, endsWith | Case-insensitive by default |
+| Number | is, isNot, isGreater, isLess, isGreaterEqual, isLessEqual, isEmpty, isNotEmpty | NULL handling is critical |
+| Date | is, isNot, isBefore, isAfter, isOnOrBefore, isOnOrAfter, isWithin, isEmpty | Timezone-aware comparisons |
+| Select | is, isNot, isAnyOf, isNoneOf, isEmpty, isNotEmpty | Exact string matching |
+| Checkbox | is | True/false only |
+| Link | contains, doesNotContain, isExactly, isEmpty, isNotEmpty | JSONB array operations |
 
 **Filter Adapter Pattern:**
 
+The Adapter pattern isolates database-specific logic. Each adapter knows how to generate SQL for its field type:
+
 ```typescript
 // Each field type has a specific adapter
-StringCellValueFilterAdapter   // Text fields
-NumberCellValueFilterAdapter   // Numeric fields
-DateTimeCellValueFilterAdapter // Date fields
-BooleanCellValueFilterAdapter  // Checkbox
-JsonCellValueFilterAdapter     // Multi-value fields
+StringCellValueFilterAdapter   // Text fields → VARCHAR operators
+NumberCellValueFilterAdapter   // Numeric fields → arithmetic comparisons
+DateTimeCellValueFilterAdapter // Date fields → temporal operators
+BooleanCellValueFilterAdapter  // Checkbox → boolean logic
+JsonCellValueFilterAdapter     // Multi-value fields → JSONB/array operators
 ```
 
 **Database-Specific SQL:**
 
+The same logical operation ("contains") produces different SQL:
+
 ```typescript
-// PostgreSQL: Case-insensitive search
+// PostgreSQL: Native case-insensitive ILIKE operator
 builderClient.whereRaw(`${column} iLIKE ?`, [`%${value}%`]);
 
-// SQLite: Uses LOWER() function
+// SQLite: No ILIKE, must use LOWER() function
 builderClient.whereRaw(`LOWER(${column}) LIKE LOWER(?)`, [`%${value}%`]);
 ```
+
+This abstraction means filter logic is written once, but correct SQL is generated for each database.
 
 ### 3.4 Sort Query System
 
@@ -350,18 +416,38 @@ const sumQuery = knex.raw(`COALESCE(SUM(${column}), 0)`).toQuery();
 
 ## 4. Formula Engine
 
+### Overview
+
+The formula engine enables Excel-like calculated fields in Teable. Users write expressions like `{Price} * {Quantity}` or `IF({Status} = "Complete", "✓", "")`, and the engine evaluates them automatically when referenced fields change.
+
+Building a formula engine requires solving several problems:
+- **Parsing**: Convert text expressions into executable form
+- **Type system**: Handle type coercion between different field types
+- **Evaluation**: Calculate results efficiently, either in the application or database
+- **Dependencies**: Track which fields a formula depends on for recalculation
+- **Circular detection**: Prevent formulas that reference themselves
+
+Teable uses **ANTLR4** for parsing—the same tool used by SQL databases and programming languages—providing a robust foundation for expression handling.
+
 ### 4.1 Architecture
+
+The formula system is organized as a pipeline from text to value:
 
 ```
 packages/core/src/formula/
 ├── parser/                    # ANTLR4 grammar & generated code
-│   ├── Formula.g4             # Parser grammar
-│   └── FormulaLexer.g4        # Lexer grammar
-├── functions/                 # 48+ built-in functions
-├── visitor.ts                 # EvalVisitor (evaluator)
-├── typed-value.ts             # Type system
-└── field-reference.visitor.ts # Dependency extraction
+│   ├── Formula.g4             # Parser grammar (expression syntax)
+│   └── FormulaLexer.g4        # Lexer grammar (token definitions)
+├── functions/                 # 48+ built-in functions (SUM, IF, TODAY, etc.)
+├── visitor.ts                 # EvalVisitor (tree-walking evaluator)
+├── typed-value.ts             # Type system (numbers, strings, dates, arrays)
+└── field-reference.visitor.ts # Dependency extraction for recalculation
 ```
+
+**Why ANTLR4?** ANTLR generates efficient parsers from grammar definitions. This ensures:
+- Correct handling of operator precedence and associativity
+- Clear error messages for syntax errors
+- Maintainable grammar as features are added
 
 ### 4.2 Parser (ANTLR4)
 
@@ -428,54 +514,92 @@ TEXT_ALL, RECORD_ID, AUTO_NUMBER
 
 ### 4.4 Evaluation Strategy
 
+One of the most important architectural decisions is **where** formulas are evaluated. Teable supports two modes, chosen automatically based on formula complexity:
+
 **Two Modes:**
 
-1. **On-Demand Evaluation** (default):
-   - Formula evaluated in application code
-   - Supports all functions including mutable ones (NOW, TODAY)
-   - Used for complex formulas with link references
+| Mode | How It Works | When Used | Trade-offs |
+|------|--------------|-----------|------------|
+| **On-Demand (Application)** | Formula evaluated in Node.js when records are fetched | Complex formulas, NOW/TODAY, link references | Flexible but slower for large datasets |
+| **Database-Generated Column** | Formula converted to SQL GENERATED column | Simple arithmetic, string ops | Fast and indexable, but limited functions |
 
-2. **Database-Generated Column** (optimized):
-   - Formula converted to native SQL
-   - Stored as `GENERATED ALWAYS AS` column
-   - Automatically recalculated by database
-   - Indexable for faster queries
+**1. On-Demand Evaluation** (default):
+- Formula evaluated in application code using the EvalVisitor
+- Supports **all functions** including mutable ones (NOW, TODAY change on each call)
+- Required for formulas referencing **link fields** (needs JOIN logic)
+- Values computed when records are queried, not stored
 
-**Generated Column Validator:**
+**2. Database-Generated Column** (optimized):
+- Formula converted to native SQL and stored as `GENERATED ALWAYS AS` column
+- The database automatically recalculates when source columns change
+- Can be **indexed** for faster filtering/sorting on computed values
+- Limited to functions that have SQL equivalents
+
+**How Teable decides which mode to use:**
+
 ```typescript
 class FormulaSupportGeneratedColumnValidator {
   validateFormula(expression: string): boolean {
-    // Check for unsupported functions
+    // Mutable functions (NOW, TODAY) can't be generated columns
+    // because their values change even when data doesn't
     if (containsMutableFunctions(expression)) return false;
 
-    // Check for link field references
+    // Link field references require JOINs that generated columns can't do
     if (hasLinkFieldReferences(expression)) return false;
 
-    // Check all functions are SQL-convertible
+    // All functions in the expression must have SQL equivalents
     return allFunctionsSupported(expression);
   }
 }
 ```
 
+**Example: Generated column vs on-demand**
+- `{Price} * {Quantity}` → Generated column (simple arithmetic)
+- `{Price} * {Quantity} * (1 - {Discount})` → Generated column
+- `DAYS_BETWEEN(TODAY(), {DueDate})` → On-demand (TODAY is mutable)
+- `{LinkedOrder}.{Total}` → On-demand (requires link resolution)
+
 ### 4.5 Dependency Tracking
 
+When a field value changes, all formulas that reference it must be recalculated. Teable maintains a **dependency graph** to track these relationships efficiently.
+
+**Why dependency tracking matters:**
+- Changing a `Price` field should update `Total = Price * Quantity`
+- But it should NOT recalculate unrelated formulas
+- The graph enables efficient invalidation without full-table scans
+
 **Circular Reference Detection:**
+
+Formulas can create cycles: A references B, B references C, C references A. These are detected at field creation time:
+
 ```typescript
 class CircularReferenceError extends Error {
-  fieldId: string;
-  expansionStack: string[];
+  fieldId: string;           // The field that would create the cycle
+  expansionStack: string[];  // The chain of dependencies
 
   getCircularChain(): string[] {
     // Returns: ["Field A", "Field B", "Field C", "Field A"]
+    // Shows exactly where the cycle occurs
   }
 }
 ```
 
 **Dependency Collector:**
+
+The `FieldReferenceVisitor` walks the formula AST to extract all field references:
+
 ```typescript
 // Collects all field IDs referenced in a formula
-FieldReferenceVisitor.getReferenceFieldIds(expression);
-// Returns: ["fld_abc", "fld_xyz"]
+const refs = FieldReferenceVisitor.getReferenceFieldIds(expression);
+// For "{Price} * {Quantity}", returns: ["fld_price", "fld_quantity"]
+
+// These are stored in the Reference table for efficient lookup
+await prisma.reference.createMany({
+  data: refs.map(fromFieldId => ({
+    toFieldId: formulaFieldId,    // The formula field
+    fromFieldId: fromFieldId,     // A field it depends on
+  }))
+});
 ```
 
 ### 4.6 Calculation Orchestration
@@ -502,17 +626,30 @@ async computeCellChangesForRecords(tableId, cellContexts, update) {
 
 ## 5. Performance Optimization
 
+### Overview
+
+Performance is critical for a database platform. Users expect:
+- **Fast page loads**: Record lists should appear instantly
+- **Responsive filtering**: Filter changes should feel immediate
+- **Scalable growth**: Performance shouldn't degrade as data grows
+
+This section covers the strategies Teable uses to maintain performance across different scales.
+
 ### 5.1 Indexing Strategy
 
-**Automatic Indexes:**
-- Primary key (`__id`)
-- Foreign keys for link fields
-- `dbTableName` on TableMeta (lookup optimization)
+Indexes are the primary tool for query performance. Teable creates some indexes automatically and provides guidance for user-created indexes.
 
-**Recommended User Indexes:**
-- Fields used in filters
-- Fields used in sorts
-- Unique constraints
+**Automatic Indexes:**
+- **Primary key** (`__id`) - Every record lookup is fast
+- **Foreign keys** for link fields - JOIN operations are optimized
+- **`dbTableName`** on TableMeta - Table lookup by physical name is instant
+- **Auto-number** (`__auto_number`) - Default sorting is efficient
+
+**When to add custom indexes:**
+- Fields frequently used in filters (WHERE clauses)
+- Fields used for sorting (ORDER BY)
+- Fields with unique constraints (also serves as index)
+- Fields used in link field "lookup by" queries
 
 ### 5.2 Query Optimization
 
