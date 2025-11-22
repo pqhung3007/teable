@@ -9,6 +9,8 @@
 3. [Backend Tech Stack](#3-backend-tech-stack)
 4. [Core Architecture Decisions](#4-core-architecture-decisions)
 5. [Related Documentation](#5-related-documentation)
+6. [Investigation Priorities](#6-investigation-priorities)
+7. [Code Exploration Strategy](#7-code-exploration-strategy)
 
 ---
 
@@ -242,11 +244,114 @@ For detailed information on specific subsystems, see:
 
 | Document | Description |
 |----------|-------------|
+| [Core Architecture](./docs/ARCHITECTURE-CORE.md) | Data persistence, views, API layer, plugins |
+| [Service Layer](./docs/ARCHITECTURE-SERVICES.md) | DDD patterns, domain events, migrations |
 | [Database Architecture](./docs/ARCHITECTURE-DATABASE.md) | Schema design, query engine, formula system |
 | [Real-time Architecture](./docs/ARCHITECTURE-REALTIME.md) | WebSocket, ShareDB, event system |
 | [Security Architecture](./docs/ARCHITECTURE-SECURITY.md) | Auth, permissions, access control |
 | [Operations Architecture](./docs/ARCHITECTURE-OPERATIONS.md) | Jobs, caching, import/export, storage |
 | [Testing & Observability](./docs/ARCHITECTURE-TESTING.md) | Testing strategy, logging, tracing |
+
+### Documentation Map
+
+```
+ANALYSIS.md (You are here)
+│
+├── Section 3: Core Architecture Decisions
+│   ├── ARCHITECTURE-CORE.md      ← Data persistence, views, API, plugins
+│   └── ARCHITECTURE-DATABASE.md  ← Query engine, formulas
+│
+├── Section 4: Service Layer Architecture
+│   └── ARCHITECTURE-SERVICES.md  ← DDD, events, migrations
+│
+├── Section 5: Real-time & Security
+│   ├── ARCHITECTURE-REALTIME.md  ← WebSocket, ShareDB
+│   └── ARCHITECTURE-SECURITY.md  ← Auth, RBAC
+│
+└── Section 6: Operations & Infrastructure
+    ├── ARCHITECTURE-OPERATIONS.md ← Jobs, cache, storage
+    └── ARCHITECTURE-TESTING.md    ← Tests, logging, tracing
+```
+
+---
+
+## 6. Investigation Priorities
+
+### Highest Priority - Core Backend
+1. **Database schema design** → [ARCHITECTURE-DATABASE.md](./docs/ARCHITECTURE-DATABASE.md)
+2. **Query engine implementation** → [ARCHITECTURE-DATABASE.md](./docs/ARCHITECTURE-DATABASE.md)
+3. **Real-time sync architecture** → [ARCHITECTURE-REALTIME.md](./docs/ARCHITECTURE-REALTIME.md)
+4. **Formula calculation backend** → [ARCHITECTURE-DATABASE.md](./docs/ARCHITECTURE-DATABASE.md)
+
+### High Priority - Business Logic
+5. **Authorization & permissions** → [ARCHITECTURE-SECURITY.md](./docs/ARCHITECTURE-SECURITY.md)
+6. **Background job processing** → [ARCHITECTURE-OPERATIONS.md](./docs/ARCHITECTURE-OPERATIONS.md)
+7. **API layer design** → [ARCHITECTURE-CORE.md](./docs/ARCHITECTURE-CORE.md)
+8. **Multi-tenancy** → [ARCHITECTURE-SECURITY.md](./docs/ARCHITECTURE-SECURITY.md)
+
+### Medium Priority - Supporting Systems
+9. **File storage backend** → [ARCHITECTURE-OPERATIONS.md](./docs/ARCHITECTURE-OPERATIONS.md)
+10. **Search and indexing** → [ARCHITECTURE-CORE.md](./docs/ARCHITECTURE-CORE.md)
+11. **Caching strategy** → [ARCHITECTURE-OPERATIONS.md](./docs/ARCHITECTURE-OPERATIONS.md)
+12. **Import/export pipeline** → [ARCHITECTURE-OPERATIONS.md](./docs/ARCHITECTURE-OPERATIONS.md)
+
+### Lower Priority - Infrastructure
+13. **Observability setup** → [ARCHITECTURE-TESTING.md](./docs/ARCHITECTURE-TESTING.md)
+14. **Testing infrastructure** → [ARCHITECTURE-TESTING.md](./docs/ARCHITECTURE-TESTING.md)
+15. **Plugin system** → [ARCHITECTURE-CORE.md](./docs/ARCHITECTURE-CORE.md)
+
+---
+
+## 7. Code Exploration Strategy
+
+### Phase 1: Core Understanding
+```bash
+# Review entry points
+apps/nestjs-backend/src/index.ts
+apps/nestjs-backend/src/app.module.ts
+
+# Understand module organization
+apps/nestjs-backend/src/features/
+
+# Review Prisma schema
+packages/db-main-prisma/prisma/template.prisma
+```
+
+### Phase 2: Deep Dive
+```bash
+# Table/Base management
+apps/nestjs-backend/src/features/table/
+apps/nestjs-backend/src/features/base/
+
+# Record CRUD
+apps/nestjs-backend/src/features/record/
+
+# View processing
+apps/nestjs-backend/src/features/view/
+
+# Real-time WebSocket
+apps/nestjs-backend/src/ws/
+apps/nestjs-backend/src/share-db/
+
+# Formula engine
+packages/core/src/formula/
+```
+
+### Phase 3: Infrastructure
+```bash
+# Authentication guards
+apps/nestjs-backend/src/features/auth/guard/
+
+# Permission decorators
+apps/nestjs-backend/src/features/auth/decorators/
+
+# Job queue setup
+apps/nestjs-backend/src/event-emitter/event-job/
+
+# Cache integration
+apps/nestjs-backend/src/cache/
+apps/nestjs-backend/src/performance-cache/
+```
 
 ---
 
