@@ -14,9 +14,25 @@
 
 ## 1. Domain-Driven Design
 
+### Overview
+
+Teable's backend architecture is influenced by **Domain-Driven Design (DDD)** principles, though it takes a pragmatic rather than purist approach. DDD is particularly well-suited for Teable because:
+
+- **Complex domain logic**: Spreadsheet operations involve intricate rules around field types, relationships, and calculations
+- **Evolving requirements**: No-code platforms constantly add new field types, view types, and integrations
+- **Team scalability**: Feature modules can be developed and maintained independently
+
+The key insight is that Teable's domain is not "data management" generically—it's specifically "no-code database operations." This distinction shapes how entities, aggregates, and bounded contexts are defined.
+
 ### 1.1 Bounded Contexts
 
-Teable organizes code into **45+ bounded contexts** (feature modules):
+In DDD, a **bounded context** is a logical boundary within which a particular domain model applies. Teable implements bounded contexts as NestJS feature modules, each with its own services, controllers, and DTOs.
+
+Teable organizes code into **45+ bounded contexts** (feature modules). Each context:
+- Owns its domain logic and data models
+- Exposes services that other contexts can import
+- Has clear interfaces with other contexts (no internal implementation leakage)
+- Can be reasoned about independently
 
 ```
 features/
@@ -49,21 +65,32 @@ features/
 
 ### 1.2 Primary Aggregates
 
+An **aggregate** in DDD is a cluster of domain objects that are treated as a single unit for data changes. The aggregate has a "root" entity that controls access to its members. In Teable:
+
+- **Table is an aggregate** because fields and views belong to tables and must maintain consistency with the table
+- **Record is an aggregate** because cell values must be valid for their field types
+- **Field is an aggregate** because field options and references form a consistent unit
+
+**Why aggregates matter**: When you delete a table, all its fields and views must be deleted. When you create a field, the table's version must increment. These transactional boundaries are enforced by making Table an aggregate root.
+
 **Table Aggregate:**
 ```typescript
 // Root: TableMeta
 // Contains: Fields, Views
-// Invariants: One primary field, unique field names
+// Invariants: One primary field, unique field names within table
 
 class TableService {
   async createTable(baseId: string, tableRo: ICreateTableRo) {
     // Enforce aggregate invariants
-    // Create physical table
-    // Initialize default view
-    // Emit TABLE_CREATE event
+    // Create physical table in database
+    // Create default primary field
+    // Initialize default grid view
+    // Emit TABLE_CREATE event for listeners
   }
 }
 ```
+
+The Table aggregate enforces that every table has exactly one primary field, field names are unique within the table, and views always have valid column configurations.
 
 **Record Aggregate:**
 ```typescript
@@ -99,7 +126,17 @@ class FieldService {
 
 ### 1.3 Entity Definitions
 
+Entities in DDD have identity—two entities with the same attributes are different if they have different IDs. Teable's entities include:
+
+- **TableMeta**: Identity is `id`, has lifecycle operations
+- **Field**: Identity is `id`, has type-specific behavior
+- **View**: Identity is `id`, has type-specific rendering logic
+- **Record**: Identity is `__id`, lives in physical tables
+
 **Factory Pattern for Fields:**
+
+The Field entity is polymorphic—a NumberField behaves differently from a LinkField. Teable uses the Factory pattern to instantiate the correct field class based on type. This encapsulates the type-switching logic and ensures each field has the right behavior.
+
 ```typescript
 // Location: features/field/model/factory.ts
 export function createFieldInstanceByVo(field: IFieldVo): IFieldInstance {
@@ -116,6 +153,8 @@ export function createFieldInstanceByVo(field: IFieldVo): IFieldInstance {
   }
 }
 ```
+
+The factory uses `class-transformer`'s `plainToInstance` to convert plain objects (from database or API) into typed class instances with methods.
 
 **Field Entity Structure:**
 ```typescript
@@ -186,40 +225,57 @@ async getTableDomainById(tableId: string): Promise<TableDomain> {
 
 ## 2. Service Organization
 
+### Overview
+
+Teable's service layer follows a **layered architecture** that separates concerns and enables testability. The key principle is **unidirectional dependency flow**: higher layers depend on lower layers, never the reverse.
+
+This layering provides several benefits:
+- **Testability**: Domain services can be unit tested without HTTP or database concerns
+- **Flexibility**: Infrastructure can be swapped (e.g., PostgreSQL to SQLite) without changing business logic
+- **Clarity**: Each layer has a clear responsibility, making code navigation easier
+
 ### 2.1 Layered Architecture
+
+Each layer has distinct responsibilities and communicates only with adjacent layers:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    API Layer (Controllers)                    │
-│  • HTTP request handling                                      │
-│  • Request validation (Zod)                                   │
-│  • Response formatting                                        │
+│  • HTTP request handling and routing                          │
+│  • Request validation (Zod schemas)                           │
+│  • Response formatting and error mapping                      │
+│  • Authentication/authorization guards                        │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │               Application Services (OpenAPI Services)         │
-│  • Use case orchestration                                     │
-│  • Transaction boundaries                                     │
-│  • Cross-domain coordination                                  │
+│  • Use case orchestration (coordinate multiple domain calls)  │
+│  • Transaction boundaries (what succeeds/fails together)      │
+│  • Cross-domain coordination (e.g., create table + fields)    │
+│  • Event emission after successful operations                 │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                   Domain Services                             │
-│  • Core business logic                                        │
-│  • Aggregate operations                                       │
-│  • Domain invariant enforcement                               │
+│  • Core business logic (validation, calculations)             │
+│  • Aggregate operations (CRUD on domain entities)             │
+│  • Domain invariant enforcement (business rules)              │
+│  • No knowledge of HTTP or external systems                   │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │               Infrastructure Services                         │
-│  • Database access (Prisma)                                   │
-│  • Cache management                                           │
-│  • External integrations                                      │
+│  • Database access (Prisma, Knex)                             │
+│  • Cache management (Redis, in-memory)                        │
+│  • External integrations (S3, email, OAuth providers)         │
+│  • Low-level operations that domain shouldn't know about      │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+**Why "OpenAPI Services"?** Teable distinguishes between internal domain services and external-facing "OpenAPI" services. The OpenAPI services are specifically designed for the REST API contract and handle concerns like field key translation, pagination, and response shaping.
 
 ### 2.2 Service Types
 
@@ -345,7 +401,21 @@ export class RecordCreateService {
 
 ## 3. Domain Events
 
+### Overview
+
+Domain events are notifications that something significant happened in the domain. In Teable, events serve multiple purposes:
+
+1. **Decoupling**: Modules can react to events without direct dependencies (e.g., history tracking doesn't need to be called explicitly)
+2. **Audit trail**: Events provide a record of what changed and when
+3. **Real-time sync**: Events trigger WebSocket broadcasts to connected clients
+4. **Automation**: User-defined automations subscribe to events
+5. **Derived data**: Computed fields and lookups recalculate based on events
+
+The event system follows the **Observer pattern**: services emit events, and listeners subscribe to events they care about. This enables loose coupling—the record service doesn't know (or care) that the history service is tracking changes.
+
 ### 3.1 Event System Architecture
+
+Teable uses NestJS's built-in event emitter with custom event classes. Events are strongly typed, providing compile-time safety for event payloads.
 
 ```typescript
 // Location: event-emitter/events/event.enum.ts
@@ -487,64 +557,111 @@ private combineEvents(events: OpEvent[]): OpEvent {
 
 ## 4. Data Migration & Schema Evolution
 
+### Overview
+
+Data migration is critical for any evolving application. Teable needs to:
+- Add new features without breaking existing data
+- Support both SQLite (development) and PostgreSQL (production)
+- Enable zero-downtime deployments
+- Maintain data integrity across schema changes
+
+Teable uses **Prisma Migrate** for schema migrations, with a custom template system that generates database-specific migrations. This approach enables:
+- **Single source of truth**: One template schema defines both SQLite and PostgreSQL schemas
+- **Database-specific optimizations**: PostgreSQL migrations can use features SQLite lacks
+- **Versioned history**: Every schema change is tracked and reversible
+
 ### 4.1 Migration Workflow
+
+The migration process involves multiple steps because Teable supports two databases. Here's the typical workflow:
 
 **Prisma Migration Process:**
 ```bash
-# 1. Modify template schema
+# 1. Modify the template schema (the source of truth)
 edit packages/db-main-prisma/prisma/template.prisma
 
-# 2. Generate database-specific schemas
+# 2. Generate database-specific schemas from template
 make gen-prisma-schema
+# This produces: prisma/postgres/schema.prisma and prisma/sqlite/schema.prisma
 
-# 3. Create migration files
+# 3. Create migration files (generates SQL)
 make db-migration
+# This creates timestamped migration directories with SQL files
 
-# 4. Apply migrations
-make sqlite.mode     # Development
-make postgres.mode   # Production
+# 4. Apply migrations to your database
+make sqlite.mode     # Development (SQLite)
+make postgres.mode   # Production (PostgreSQL)
 ```
+
+**Why a template schema?** SQLite and PostgreSQL have different syntax and capabilities. The template uses a common subset, and the generator handles database-specific translations (e.g., `JSONB` becomes `TEXT` in SQLite).
 
 ### 4.2 Migration History
 
-**56+ Migrations** covering:
-- Initial schema setup
-- Feature additions (conditional lookups, AI config)
-- Performance indexes
-- Constraint modifications
-- Data repairs
+Teable's migration history tells the story of its evolution. Each migration is a snapshot of a feature addition, bug fix, or performance improvement.
 
-**Migration Naming:**
+**56+ Migrations** covering:
+- **Initial schema setup**: Core tables (Space, Base, TableMeta, Field, View, etc.)
+- **Feature additions**: Conditional lookups, AI field config, button fields
+- **Performance indexes**: Optimizing common query patterns
+- **Constraint modifications**: Adding unique constraints, foreign keys
+- **Data repairs**: Fixing historical data issues from bugs
+
+**Migration Naming Convention:**
 ```
 YYYYMMDDHHmmss_<description>
-20250922120000_add_conditional_lookup_flag
-20250905035737_add_trash_index
-20250828083308_add_app_robot_user
+20250922120000_add_conditional_lookup_flag    # Feature flag for new lookup behavior
+20250905035737_add_trash_index                # Performance: index for trash queries
+20250828083308_add_app_robot_user             # Feature: system users for automation
 ```
+
+**Reading migration history** is valuable for understanding:
+- When a feature was introduced (to understand backwards compatibility)
+- What indexes exist (for query optimization)
+- How data structures evolved (for debugging data issues)
 
 ### 4.3 Zero-Downtime Strategies
 
-**Column Addition Pattern:**
+Production deployments require migrations that don't lock tables or cause errors for running applications. Teable uses several patterns to achieve zero-downtime migrations:
+
+**Pattern 1: Add Nullable Column, Then Backfill**
+
+This is the safest approach for adding new columns:
+
 ```sql
--- Add nullable column
+-- Step 1: Add nullable column (fast, no table lock)
 ALTER TABLE "field" ADD COLUMN "is_conditional_lookup" BOOLEAN;
 
--- Backfill data
+-- Step 2: Backfill data in batches (can run while app is live)
 UPDATE "field" SET is_conditional_lookup = false WHERE is_lookup = true;
 
--- Add constraints later (if needed)
+-- Step 3: Add constraints later (separate deployment if needed)
+-- ALTER TABLE "field" ALTER COLUMN "is_conditional_lookup" SET NOT NULL;
 ```
 
-**Constraint Migration Pattern:**
+**Why nullable first?** Adding a NOT NULL column would require a default value and could lock large tables. Nullable columns can be added instantly, then filled asynchronously.
+
+**Pattern 2: Safe Unique Constraint Addition**
+
+Adding unique constraints can fail if duplicates exist. The pattern handles this:
+
 ```sql
 BEGIN;
--- Remove duplicates first
-WITH duplicates AS (...)
-DELETE FROM table WHERE ...;
+-- First, identify and remove/merge duplicates
+WITH duplicates AS (
+  SELECT id, ROW_NUMBER() OVER (PARTITION BY unique_cols ORDER BY created_time) as rn
+  FROM table
+)
+DELETE FROM table WHERE id IN (SELECT id FROM duplicates WHERE rn > 1);
 
--- Then add unique constraint
-CREATE UNIQUE INDEX "idx_unique" ON "table"(...);
+-- Then safely add the constraint
+CREATE UNIQUE INDEX "idx_unique" ON "table"(unique_cols);
 COMMIT;
+```
+
+**Pattern 3: Concurrent Index Creation (PostgreSQL)**
+
+For large tables, indexes can be created without blocking writes:
+```sql
+CREATE INDEX CONCURRENTLY "idx_name" ON "table"(column);
 ```
 
 ### 4.4 Deployment Integration
